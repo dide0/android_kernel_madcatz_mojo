@@ -2553,7 +2553,7 @@ static int tegra_dc_probe(struct platform_device *ndev)
 	tegra_dc_hotplug_init(dc);
 
 	if (dc->out_ops && dc->out_ops->detect)
-		dc->out_ops->detect(dc);
+		dc->connected = dc->out_ops->detect(dc);
 	else
 		dc->connected = true;
 
