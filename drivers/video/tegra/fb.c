@@ -288,13 +288,17 @@ static int tegra_fb_blank(int blank, struct fb_info *info)
 	switch (blank) {
 	case FB_BLANK_UNBLANK:
 		dev_info(&tegra_fb->ndev->dev, "unblank\n");
+<<<<<<< HEAD
+=======
+		tegra_fb->win->flags = TEGRA_WIN_FLAG_ENABLED;
+>>>>>>> 664f256... video: tegra: hdmi: fix problem with audio not being enabled on boot
 		tegra_dc_enable(tegra_fb->win->dc);
 		tegra_dc_update_windows(&tegra_fb->win, 1);
 		tegra_dc_sync_windows(&tegra_fb->win, 1);
 		return 0;
 
 	case FB_BLANK_NORMAL:
-		dev_dbg(&tegra_fb->ndev->dev, "blank - normal\n");
+		dev_info(&tegra_fb->ndev->dev, "blank - normal\n");
 		/* To pan fb at the unblank */
 		if (tegra_fb->win->dc->enabled)
 			tegra_fb->curr_xoffset = -1;
