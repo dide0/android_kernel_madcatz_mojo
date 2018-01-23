@@ -374,6 +374,36 @@ int sg_alloc_table_from_pages(struct sg_table *sgt,
 }
 EXPORT_SYMBOL(sg_alloc_table_from_pages);
 
+void __sg_page_iter_start(struct sg_page_iter *piter,
+			  struct scatterlist *sglist, unsigned int nents,
+			  unsigned long pgoffset)
+{
+	piter->__pg_advance = 0;
+	piter->__nents = nents;
+	piter->sg = sglist;
+	piter->sg_pgoffset = pgoffset;
+}
+EXPORT_SYMBOL(__sg_page_iter_start);
+static int sg_page_count(struct scatterlist *sg)
+{
+	return PAGE_ALIGN(sg->offset + sg->length) >> PAGE_SHIFT;
+}
+bool __sg_page_iter_next(struct sg_page_iter *piter)
+{
+	if (!piter->__nents || !piter->sg)
+		return false;
+	piter->sg_pgoffset += piter->__pg_advance;
+	piter->__pg_advance = 1;
+	while (piter->sg_pgoffset >= sg_page_count(piter->sg)) {
+		piter->sg_pgoffset -= sg_page_count(piter->sg);
+		piter->sg = sg_next(piter->sg);
+		if (!--piter->__nents || !piter->sg)
+			return false;
+	}
+	return true;
+}
+EXPORT_SYMBOL(__sg_page_iter_next);
+
 /**
  * sg_miter_start - start mapping iteration over a sg list
  * @miter: sg mapping iter to be started
@@ -391,9 +421,7 @@ void sg_miter_start(struct sg_mapping_iter *miter, struct scatterlist *sgl,
 {
 	memset(miter, 0, sizeof(struct sg_mapping_iter));
 
-	miter->__sg = sgl;
-	miter->__nents = nents;
-	miter->__offset = 0;
+	__sg_page_iter_start(&miter->piter, sgl, nents, 0);
 	WARN_ON(!(flags & (SG_MITER_TO_SG | SG_MITER_FROM_SG)));
 	miter->__flags = flags;
 }
