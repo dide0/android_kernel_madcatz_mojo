@@ -32,6 +32,7 @@
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <sound/core.h>
 #include <sound/jack.h>
 
@@ -42,10 +43,30 @@
 #include "hda_codec.h"
 #include "hda_local.h"
 #include "hda_jack.h"
+#include "hda_eld.h"
 
+#ifdef LIMITED_RATE_FMT_SUPPORT
+/* support only the safe format and rate */
+#define SUPPORTED_RATES		SNDRV_PCM_RATE_48000
+#define SUPPORTED_MAXBPS	16
+#define SUPPORTED_FORMATS	SNDRV_PCM_FMTBIT_S16_LE
+#else
+/* support all rates and formats */
+#define SUPPORTED_RATES \
+	(SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |\
+	SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 |\
+	 SNDRV_PCM_RATE_192000)
+#define SUPPORTED_MAXBPS	24
+#define SUPPORTED_FORMATS \
+	(SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE)
+#endif
+  		
 static bool static_hdmi_pcm;
 module_param(static_hdmi_pcm, bool, 0644);
 MODULE_PARM_DESC(static_hdmi_pcm, "Don't restrict PCM parameters per ELD info");
+
+/* Used to avoid race conditions when reading ELD data. */
+static DEFINE_MUTEX(eld_mutex);
 
 /*
  * The HDMI/DisplayPort configuration can be highly dynamic. A graphics device
@@ -76,6 +97,7 @@ struct hdmi_spec_per_pin {
 	struct hdmi_eld sink_eld;
 	struct delayed_work work;
 	int repoll_count;
+    int audio_mode_to_query;
 };
 
 struct hdmi_spec {
@@ -217,8 +239,13 @@ static int hdmi_channel_mapping[0x32][8] = {
 	[0x09] = { 0x00, 0x11, 0x24, 0x35, 0x42, 0xf3, 0xf6, 0xf7 },
 	/* surround50 */
 	[0x0a] = { 0x00, 0x11, 0x24, 0x35, 0x43, 0xf2, 0xf6, 0xf7 },
-	/* surround51 */
-	[0x0b] = { 0x00, 0x11, 0x24, 0x35, 0x43, 0x52, 0xf6, 0xf7 },
+	/*
+	 * surround51 - this is the hda programming sequence used
+	 * if pcm data has alsa channel ordering: FL FR RL RR FC LFE
+	 * [0x0b] = { 0x00, 0x11, 0x24, 0x35, 0x43, 0x52, 0xf6, 0xf7 },
+	 */
+	/* surround51 - android channel ordering: FL FR FC LFE RL RR */
+	[0x0b] = { 0x00, 0x11, 0x23, 0x32, 0x44, 0x55, 0xf6, 0xf7 },
 	/* 7.1 */
 	[0x13] = { 0x00, 0x11, 0x26, 0x37, 0x43, 0x52, 0x64, 0x75 },
 };
@@ -394,7 +421,265 @@ static int hdmi_create_eld_ctl(struct hda_codec *codec, int pin_idx,
 	return 0;
 }
 
-#ifdef BE_PARANOID
+static int hdmi_audio_max_chan_ctl_get(struct snd_kcontrol *kcontrol,
+ 				       struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 	struct hdmi_eld *eld = &spec->pins[idx].sink_eld;
+ 	int val = 0;
+ 
+ 	/* If basic audio is not supported, then no audio is supported.
+ 	 * Since eld has no basic audio information, we look at
+ 	 * spk_alloc to see if it's non-zero as an indiction of audio
+ 	 * support.
+ 	 */
+ 	if (eld->spk_alloc) {
+ 		u32 ndx;
+ 
+ 		/* Basic audio supported, so we support at least 2 channels */
+ 		val = 2;
+ 
+ 		/* Scan all of the non-basic modes looking for any higher
+ 		 * channel counts.  If we ever hit 8 channels, we can stop since
+ 		 * 8 is the max for HDMI.
+ 		 */
+ 		for (ndx = 0; ndx < eld->sad_count && val < 8; ndx++) {
+ 			if (val < eld->sad[ndx].channels)
+ 				val = eld->sad[ndx].channels;
+ 		}
+ 	}
+ 
+ 	ucontrol->value.integer.value[0] = val;
+ 	return 0;
+ }
+ 
+ static int hdmi_audio_basic_audio_ctl_get(struct snd_kcontrol *kcontrol,
+ 					  struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 
+ 	/*
+ 	 * Since eld has no basic audio information, we look at
+ 	 * spk_alloc to see if it's non-zero as an indiction of audio
+ 	 * support.
+ 	 */
+ 	if (spec->pins[idx].sink_eld.spk_alloc == 0)
+ 		ucontrol->value.integer.value[0] = 0;
+ 	else
+ 		ucontrol->value.integer.value[0] = 1;
+ 	return 0;
+ }
+ 
+ static int hdmi_audio_speaker_alloc_ctl_get(struct snd_kcontrol *kcontrol,
+ 					    struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 
+ 	ucontrol->value.integer.value[0] = spec->pins[idx].sink_eld.spk_alloc;
+ 	return 0;
+ }
+ 
+ static int hdmi_audio_mode_cnt_ctl_get(struct snd_kcontrol *kcontrol,
+ 				       struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 
+ 	ucontrol->value.integer.value[0] = spec->pins[idx].sink_eld.sad_count;
+ 	return 0;
+ }
+ 
+ static int hdmi_audio_mode_to_query_ctl_get(struct snd_kcontrol *kcontrol,
+ 					    struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 
+ 	ucontrol->value.integer.value[0] = spec->pins[idx].audio_mode_to_query;
+ 	return 0;
+ }
+ 
+ static int hdmi_audio_mode_to_query_ctl_put(struct snd_kcontrol *kcontrol,
+ 					    struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 
+ 	if (ucontrol->value.integer.value[0] >=
+ 	    spec->pins[idx].sink_eld.sad_count) {
+ 		pr_warn("audio mode value %lu invalid.  should be 0 to %d\n",
+ 			ucontrol->value.integer.value[0],
+ 			spec->pins[idx].sink_eld.sad_count);
+ 		return -EINVAL;
+ 	}
+ 	spec->pins[idx].audio_mode_to_query = ucontrol->value.integer.value[0];
+ 	return 0;
+ }
+ 
+ static int hdmi_audio_qmode_format_ctl_get(struct snd_kcontrol *kcontrol,
+ 					   struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 	struct cea_sad *sad = spec->pins[idx].sink_eld.sad;
+ 
+ 	sad += spec->pins[idx].audio_mode_to_query;
+ 
+ 	ucontrol->value.integer.value[0] = sad->format;
+ 	return 0;
+ }
+ 
+ static int hdmi_audio_qmode_max_ch_cnt_ctl_get(struct snd_kcontrol *kcontrol,
+ 					struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 	struct cea_sad *sad = spec->pins[idx].sink_eld.sad;
+ 
+ 	sad += spec->pins[idx].audio_mode_to_query;
+ 
+ 	ucontrol->value.integer.value[0] = sad->channels;
+ 	return 0;
+ }
+ 
+ static int hdmi_audio_qmode_sample_rates_ctl_get(struct snd_kcontrol *kcontrol,
+ 					struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 	struct cea_sad *sad = spec->pins[idx].sink_eld.sad;
+ 
+ 	sad += spec->pins[idx].audio_mode_to_query;
+ 
+ 	ucontrol->value.integer.value[0] = sad->rates;
+ 	return 0;
+ }
+ 
+ static int hdmi_audio_qmode_bps_ctl_get(struct snd_kcontrol *kcontrol,
+ 				struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 	struct cea_sad *sad = spec->pins[idx].sink_eld.sad;
+ 
+ 	sad += spec->pins[idx].audio_mode_to_query;
+ 
+ 	ucontrol->value.integer.value[0] = sad->sample_bits;
+ 	return 0;
+ }
+ 
+ static int hdmi_audio_qmode_comp_br_ctl_get(struct snd_kcontrol *kcontrol,
+ 					struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int idx = kcontrol->private_value;
+ 	struct cea_sad *sad = spec->pins[idx].sink_eld.sad;
+ 
+ 	sad += spec->pins[idx].audio_mode_to_query;
+ 
+ 	ucontrol->value.integer.value[0] = sad->max_bitrate;
+ 	return 0;
+ }
+ 
+ #define MIXER_INFO_FUNC(_sym_name, _type, _min, _max) \
+ static int hdmi_audio_##_sym_name##_ctl_info(struct snd_kcontrol *kcontrol, \
+ 					     struct snd_ctl_elem_info *uinfo) \
+ { \
+ 	uinfo->type = SNDRV_CTL_ELEM_TYPE_##_type ; \
+ 	uinfo->count = 1; \
+ 	uinfo->value.integer.min = _min; \
+ 	uinfo->value.integer.max = _max; \
+ 	return 0; \
+ }
+ 
+ #define MIXER_CONTROL(_ctl_name, _sym_name, _access, _get, _put) \
+ { \
+ 	.access = _access | SNDRV_CTL_ELEM_ACCESS_VOLATILE, \
+ 	.iface = SNDRV_CTL_ELEM_IFACE_PCM, \
+ 	.name = _ctl_name, \
+ 	.info = hdmi_audio_##_sym_name##_ctl_info, \
+ 	.get = _get, \
+ 	.put = _put, \
+ }
+ 
+ #define RO_MIXER_CONTROL(_ctl_name, _sym_name) \
+ 	MIXER_CONTROL(_ctl_name, _sym_name, \
+ 		SNDRV_CTL_ELEM_ACCESS_READ, \
+ 		hdmi_audio_##_sym_name##_ctl_get, \
+ 		NULL)
+ 
+ #define RW_MIXER_CONTROL(_ctl_name, _sym_name) \
+ 	MIXER_CONTROL(_ctl_name, _sym_name, \
+ 		SNDRV_CTL_ELEM_ACCESS_READ | SNDRV_CTL_ELEM_ACCESS_WRITE, \
+ 		hdmi_audio_##_sym_name##_ctl_get, \
+ 		hdmi_audio_##_sym_name##_ctl_put)
+ 
+ MIXER_INFO_FUNC(max_chan, INTEGER, 0, 8);
+ MIXER_INFO_FUNC(basic_audio, BOOLEAN, 0, 1);
+ MIXER_INFO_FUNC(speaker_alloc, INTEGER, 0, 0x3FF);
+ MIXER_INFO_FUNC(mode_cnt, INTEGER, 0, 0x7FFFFFFF);
+ MIXER_INFO_FUNC(mode_to_query, INTEGER, 0, 0x7FFFFFFF);
+ MIXER_INFO_FUNC(qmode_format, INTEGER, AUDIO_CODING_TYPE_LPCM,
+ 		AUDIO_CODING_TYPE_MPEG_SURROUND);
+ MIXER_INFO_FUNC(qmode_max_ch_cnt, INTEGER, 0, 8);
+ MIXER_INFO_FUNC(qmode_sample_rates, INTEGER, 0, SUPPORTED_RATES);
+ MIXER_INFO_FUNC(qmode_bps, INTEGER, 0, (AC_SUPPCM_BITS_24 | \
+ 					AC_SUPPCM_BITS_20 | \
+ 					AC_SUPPCM_BITS_16));
+ MIXER_INFO_FUNC(qmode_comp_br, INTEGER, 0, 0x7FFFFFFF);
+ 
+ static struct snd_kcontrol_new hdmi_audio_ctls[] = {
+ 	RO_MIXER_CONTROL("Maximum LPCM channels", max_chan),
+ 	RO_MIXER_CONTROL("Basic Audio Supported", basic_audio),
+ 	RO_MIXER_CONTROL("Speaker Allocation", speaker_alloc),
+ 	RO_MIXER_CONTROL("Audio Mode Count", mode_cnt),
+ 	RW_MIXER_CONTROL("Audio Mode To Query", mode_to_query),
+ 	RO_MIXER_CONTROL("Query Mode : Format", qmode_format),
+ 	RO_MIXER_CONTROL("Query Mode : Max Ch Count", qmode_max_ch_cnt),
+ 	RO_MIXER_CONTROL("Query Mode : Sample Rate Mask",
+ 			qmode_sample_rates),
+ 	RO_MIXER_CONTROL("Query Mode : PCM Bits/Sample Mask", qmode_bps),
+ 	RO_MIXER_CONTROL("Query Mode : Max Compressed Bitrate",
+ 			qmode_comp_br),
+ };
+ 
+ static int hdmi_create_audio_ctl(struct hda_codec *codec, int pin_idx,
+ 			int device)
+ {
+ 	struct snd_kcontrol *kctl;
+ 	struct hdmi_spec *spec = codec->spec;
+ 	int err;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(hdmi_audio_ctls); i++) {
+ 		kctl = snd_ctl_new1(&hdmi_audio_ctls[i], codec);
+ 		if (!kctl)
+ 			return -ENOMEM;
+ 		kctl->private_value = pin_idx;
+ 		kctl->id.device = device;
+ 
+ 		err = snd_hda_ctl_add(codec, spec->pins[pin_idx].pin_nid, kctl);
+ 		if (err < 0)
+ 			return err;
+ 	}
+ 	return 0;
+ }
+ 
+ #ifdef BE_PARANOID
 static void hdmi_get_dip_index(struct hda_codec *codec, hda_nid_t pin_nid,
 				int *packet_index, int *byte_index)
 {
@@ -764,9 +1049,6 @@ static void hdmi_intrinsic_event(struct hda_codec *codec, unsigned int res)
 	int pin_nid;
 	int pin_idx;
 	struct hda_jack_tbl *jack;
-#ifdef CONFIG_SND_HDA_PLATFORM_NVIDIA_TEGRA
-	struct hdmi_eld *eld = &spec->pins[pin_idx].sink_eld;
-#endif
 
 	jack = snd_hda_jack_tbl_get_from_tag(codec, tag);
 	if (!jack)
@@ -784,19 +1066,6 @@ static void hdmi_intrinsic_event(struct hda_codec *codec, unsigned int res)
 		return;
 
 	hdmi_present_sense(&spec->pins[pin_idx], 1);
-
-#ifdef CONFIG_SND_HDA_PLATFORM_NVIDIA_TEGRA
-	if (((codec->preset->id == 0x10de0020) ||
-		(codec->preset->id == 0x10de0022))) {
-		/*
-		 * HDMI sink's ELD info cannot always be retrieved for now, e.g.
-		 * in console or for audio devices. Assume the highest speakers
-		 * configuration, to _not_ prohibit multi-channel audio playback
-		 */
-		if (!eld->spk_alloc)
-			eld->spk_alloc = 0xffff;
-	}
-#endif
 
 	snd_hda_jack_report_sync(codec);
 }
@@ -907,18 +1176,19 @@ static int hdmi_pcm_open(struct hda_pcm_stream *hinfo,
 	eld = &per_pin->sink_eld;
 
 #ifdef CONFIG_SND_HDA_PLATFORM_NVIDIA_TEGRA
-	if ((((codec->preset->id == 0x10de0020) ||
-		(codec->preset->id == 0x10de0022))) &&
-		(!eld->monitor_present || !eld->lpcm_sad_ready)) {
-		if (!eld->monitor_present) {
-			if (tegra_hdmi_setup_hda_presence() < 0) {
-				snd_printk(KERN_WARNING
-					   "HDMI: No HDMI device connected\n");
-				return -ENODEV;
-			}
-		}
+	if (((codec->preset->id == 0x10de0020) ||
+		(codec->preset->id == 0x10de0022))) {
+		/* Fallback in case the presence interrupt went unnoticed.
+		 * This seems to happen sometimes. In this case, sense the
+		 * monitor manually */
+		snd_hda_jack_set_dirty_all(codec);
+		hdmi_present_sense(per_pin, 0);
+		snd_hda_jack_report_sync(codec);
+
+		/* From here ELD should be ready. If it's not, ask user-space
+		 * to try again later */
 		if (!eld->lpcm_sad_ready)
-			return -ENODEV;
+			return -EBUSY;
 	}
 #endif
 
@@ -1021,6 +1291,15 @@ static void hdmi_present_sense(struct hdmi_spec_per_pin *per_pin, int repoll)
 	int present = snd_hda_pin_sense(codec, pin_nid);
 	bool eld_valid = false;
 
+	mutex_lock(&eld_mutex);
+
+	/* Status unchanged? We might already be using the ELD data, so
+	 * don't mess with it */
+	if (eld->monitor_present == (!!(present & AC_PINSENSE_PRESENCE))) {
+		mutex_unlock(&eld_mutex);
+		return;
+	}
+
 	memset(eld, 0, offsetof(struct hdmi_eld, eld_buffer));
 
 	eld->monitor_present	= !!(present & AC_PINSENSE_PRESENCE);
@@ -1041,21 +1320,6 @@ static void hdmi_present_sense(struct hdmi_spec_per_pin *per_pin, int repoll)
 					   msecs_to_jiffies(300));
 		}
 	}
-}
-
-static void hdmi_repoll_eld(struct work_struct *work)
-{
-	struct hdmi_spec_per_pin *per_pin =
-	container_of(to_delayed_work(work), struct hdmi_spec_per_pin, work);
-#ifdef CONFIG_SND_HDA_PLATFORM_NVIDIA_TEGRA
-	struct hda_codec *codec = per_pin->codec;
-	struct hdmi_eld *eld = &per_pin->sink_eld;
-#endif
-
-	if (per_pin->repoll_count++ > 6)
-		per_pin->repoll_count = 0;
-
-	hdmi_present_sense(per_pin, per_pin->repoll_count);
 
 #ifdef CONFIG_SND_HDA_PLATFORM_NVIDIA_TEGRA
 	if ((codec->preset->id == 0x10de0020) ||
@@ -1069,6 +1333,18 @@ static void hdmi_repoll_eld(struct work_struct *work)
 			eld->spk_alloc = 0xffff;
 	}
 #endif
+	mutex_unlock(&eld_mutex);
+}
+
+static void hdmi_repoll_eld(struct work_struct *work)
+{
+	struct hdmi_spec_per_pin *per_pin =
+	container_of(to_delayed_work(work), struct hdmi_spec_per_pin, work);
+
+	if (per_pin->repoll_count++ > 6)
+		per_pin->repoll_count = 0;
+
+	hdmi_present_sense(per_pin, per_pin->repoll_count);
 }
 
 static int hdmi_add_pin(struct hda_codec *codec, hda_nid_t pin_nid)
@@ -1354,7 +1630,15 @@ static int generic_hdmi_build_controls(struct hda_codec *codec)
 		if (err < 0)
 			return err;
 
-		hdmi_present_sense(per_pin, 0);
+		/* add control for hdmi audio */
+ 		err = hdmi_create_audio_ctl(codec,
+ 					pin_idx,
+ 					spec->pcm_rec[pin_idx].device);
+ 
+ 		if (err < 0)
+ 			return err;
+ 
+        hdmi_present_sense(per_pin, 0);
 	}
 
 	return 0;
@@ -1538,22 +1822,6 @@ static const struct hda_verb nvhdmi_basic_init_7x[] = {
 	{ 0xd, AC_VERB_SET_PIN_WIDGET_CONTROL, PIN_OUT | 0x5 },
 	{} /* terminator */
 };
-
-#ifdef LIMITED_RATE_FMT_SUPPORT
-/* support only the safe format and rate */
-#define SUPPORTED_RATES		SNDRV_PCM_RATE_48000
-#define SUPPORTED_MAXBPS	16
-#define SUPPORTED_FORMATS	SNDRV_PCM_FMTBIT_S16_LE
-#else
-/* support all rates and formats */
-#define SUPPORTED_RATES \
-	(SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000 |\
-	SNDRV_PCM_RATE_88200 | SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 |\
-	 SNDRV_PCM_RATE_192000)
-#define SUPPORTED_MAXBPS	24
-#define SUPPORTED_FORMATS \
-	(SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE)
-#endif
 
 static int nvhdmi_7x_init(struct hda_codec *codec)
 {
