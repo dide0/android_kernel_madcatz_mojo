@@ -193,9 +193,8 @@ int tegra_edid_read_block(struct tegra_edid *edid, int block, u8 *data)
 	{
 		//printk("(status != msg_len) \n");
 		return -EIO;
-<<<<<<< HEAD
 	}
-=======
+
 
 	for (i = 0; i < 128; i++)
 		checksum += data[i];
@@ -204,7 +203,6 @@ int tegra_edid_read_block(struct tegra_edid *edid, int block, u8 *data)
 		return -EIO;
 	}
 
->>>>>>> b5bfcec... video: tegra: edid: Verify checksum of edid
 	return 0;
 }
 

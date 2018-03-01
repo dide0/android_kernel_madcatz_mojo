@@ -431,73 +431,6 @@ static inline void tegra_hdmi_clrsetbits(struct tegra_dc_hdmi_data *hdmi,
 	tegra_hdmi_writel(hdmi, val, reg);
 }
 
-static bool tegra_dc_hdmi_hpd(struct tegra_dc *dc)
-{
-	return tegra_dc_hpd(dc);
-}
-
-static inline void tegra_hdmi_hotplug_signal(struct tegra_dc_hdmi_data *hdmi)
-{
-	tegra_dc_hpd(hdmi->dc);
-	queue_delayed_work(system_nrt_wq, &hdmi->work,
-		msecs_to_jiffies(1000));
-}
-
-/* disables hotplug IRQ - this must be balanced */
-static inline void tegra_hdmi_hotplug_disable(struct tegra_dc_hdmi_data *hdmi)
-{
-	struct tegra_dc *dc = hdmi->dc;
-
-	disable_irq(gpio_to_irq(dc->out->hotplug_gpio));
-}
-
-/* enables hotplug IRQ - this must be balanced */
-static inline void tegra_hdmi_hotplug_enable(struct tegra_dc_hdmi_data *hdmi)
-{
-	struct tegra_dc *dc = hdmi->dc;
-
-	enable_irq(gpio_to_irq(dc->out->hotplug_gpio));
-}
-
-void tegra_hdmi_enable_clk(void)
-{
-	struct tegra_dc_hdmi_data *hdmi = dc_hdmi;
-	struct tegra_dc *dc;
-
-	if (!hdmi)
-		return;
-
-	dc = hdmi->dc;
-
-	mutex_lock(&dc->lock);
-	clk_prepare_enable(hdmi->disp1_clk);
-	clk_prepare_enable(hdmi->disp2_clk);
-	clk_prepare_enable(hdmi->clk);
-	mutex_unlock(&dc->lock);
-	atomic_set(&tf_hdmi_enable, 1);
-}
-EXPORT_SYMBOL(tegra_hdmi_enable_clk);
-
-void tegra_hdmi_disable_clk(void)
-{
-	struct tegra_dc_hdmi_data *hdmi = dc_hdmi;
-	struct tegra_dc *dc;
-
-	if (!hdmi)
-		return;
-
-	dc = hdmi->dc;
-
-	atomic_set(&tf_hdmi_enable, 0);
-	mutex_lock(&dc->lock);
-	clk_disable_unprepare(hdmi->clk);
-	clk_disable_unprepare(hdmi->disp1_clk);
-	clk_disable_unprepare(hdmi->disp2_clk);
-	mutex_unlock(&dc->lock);
-
-}
-EXPORT_SYMBOL(tegra_hdmi_disable_clk);
-
 #ifdef CONFIG_DEBUG_FS
 static int dbg_hdmi_show(struct seq_file *m, void *unused)
 {
@@ -950,13 +883,8 @@ bool tegra_dc_hdmi_mode_filter(const struct tegra_dc *dc,
 	return true;
 }
 
-<<<<<<< HEAD
-
-/* used by tegra_dc_probe() to detect hpd/hdmi status at boot */
-=======
 /* used by tegra_dc_probe() to detect hpd/hdmi status at boot.
  */
->>>>>>> 664f256... video: tegra: hdmi: fix problem with audio not being enabled on boot
 static bool tegra_dc_hdmi_detect(struct tegra_dc *dc)
 {
 	/* trigger an edid read by the hdmi state machine */
@@ -1020,9 +948,6 @@ static void tegra_dc_hdmi_resume(struct tegra_dc *dc)
 		disable_irq_wake(gpio_to_irq(dc->out->hotplug_gpio));
 
 	tegra_nvhdcp_resume(hdmi->nvhdcp);
-	/* restore hotplug detection */
-	tegra_hdmi_hotplug_enable(hdmi);
-	tegra_hdmi_hotplug_signal(hdmi);
 }
 
 #ifdef CONFIG_SWITCH
@@ -1039,27 +964,12 @@ static ssize_t underscan_show(struct device *dev,
 }
 
 static DEVICE_ATTR(underscan, S_IRUGO | S_IWUSR, underscan_show, NULL);
-
-static ssize_t hdmi_audio_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct tegra_dc_hdmi_data *hdmi =
-			container_of(dev_get_drvdata(dev), struct tegra_dc_hdmi_data, audio_switch);
-
-	if (hdmi->edid)
-		return sprintf(buf, "%d\n", tegra_edid_audio_supported(hdmi->edid));
-	else
-		return 0;
-}
-
-static DEVICE_ATTR(hdmi_audio, S_IRUGO | S_IWUSR, hdmi_audio_show, NULL);
 #endif
 
 static int tegra_dc_hdmi_init(struct tegra_dc *dc)
 {
 	struct tegra_dc_hdmi_data *hdmi;
 	struct resource *res;
-	struct resource hdmi_res;
 	struct resource *base_res;
 #ifdef CONFIG_SWITCH
 	int ret;
@@ -1070,20 +980,14 @@ static int tegra_dc_hdmi_init(struct tegra_dc *dc)
 	struct clk *disp2_clk = NULL;
 	struct tegra_hdmi_out *hdmi_out = NULL;
 	int err;
-	struct device_node *np = dc->ndev->dev.of_node;
-	struct device_node *np_hdmi =
-		of_find_compatible_node(NULL, NULL, "nvidia,tegra114-hdmi");
 
 	hdmi = kzalloc(sizeof(*hdmi), GFP_KERNEL);
 	if (!hdmi)
 		return -ENOMEM;
-	if (np && np_hdmi) {
-		of_address_to_resource(np_hdmi, 0, &hdmi_res);
-		res = &hdmi_res;
-	} else {
-		res = platform_get_resource_byname(dc->ndev,
-			IORESOURCE_MEM, "hdmi_regs");
-	}
+
+	res = platform_get_resource_byname(dc->ndev,
+		IORESOURCE_MEM, "hdmi_regs");	
+
 	if (!res) {
 		dev_err(&dc->ndev->dev, "hdmi: no mem resource\n");
 		err = -ENOENT;
@@ -1197,13 +1101,6 @@ static int tegra_dc_hdmi_init(struct tegra_dc *dc)
 			&dev_attr_underscan);
 	BUG_ON(ret != 0);
 
-	hdmi->audio_switch.name = "hdmi_audio";
-	ret = switch_dev_register(&hdmi->audio_switch);
-
-	if (!ret)
-		ret = device_create_file(hdmi->audio_switch.dev,
-			&dev_attr_hdmi_audio);
-	BUG_ON(ret != 0);
 #endif
 
 	dc->out->depth = 24;
@@ -1272,7 +1169,6 @@ static void tegra_dc_hdmi_destroy(struct tegra_dc *dc)
 	hdmi_state_machine_shutdown();
 #ifdef CONFIG_SWITCH
 	switch_dev_unregister(&hdmi->hpd_switch);
-	switch_dev_unregister(&hdmi->audio_switch);
 #endif
 	iounmap(hdmi->base);
 	release_resource(hdmi->base_res);
@@ -1941,12 +1837,8 @@ static void tegra_dc_hdmi_enable(struct tegra_dc *dc)
 		tegra_dc_setup_clk(dc, hdmi->clk);
 		clk_set_rate(hdmi->clk, dc->mode.pclk);
 
-<<<<<<< HEAD
-	clk_prepare_enable(hdmi->clk);
-	if (!atomic_read(&tf_hdmi_enable)) {
-=======
+
 		clk_prepare_enable(hdmi->clk);
->>>>>>> e854dbd... video: tegra: hdmi: don't change clock or stop DC if already in right state
 		tegra_periph_reset_assert(hdmi->clk);
 		mdelay(1);
 		tegra_periph_reset_deassert(hdmi->clk);
@@ -1960,8 +1852,11 @@ static void tegra_dc_hdmi_enable(struct tegra_dc *dc)
 
 	tegra_dc_io_start(dc);
 	tegra_dc_writel(dc, VSYNC_H_POSITION(1), DC_DISP_DISP_TIMING_OPTIONS);
-	tegra_dc_writel(dc, DITHER_CONTROL_DISABLE | BASE_COLOR_SIZE888,
-			DC_DISP_DISP_COLOR_CONTROL);
+	
+	dc->out->depth = 24;
+	dc->out->dither = TEGRA_DC_DISABLE_DITHER;
+	tegra_dc_set_color_control(dc);
+
 
 	/* video_preamble uses h_pulse2 */
 	pulse_start = dc->mode.h_ref_to_sync + dc->mode.h_sync_width +
